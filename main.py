@@ -5,6 +5,20 @@ import requests
 import config
 import asyncio
 from typing import Optional
+import json
+import os
+from datetime import datetime
+import logging
+
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
 
 class StreamNotifier(discord.Client):
     def __init__(self):
@@ -15,7 +29,7 @@ class StreamNotifier(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.streamers_status = {}
         self.access_token = None
-        self.streamers = config.load_streamers()
+        self.streamers = self.load_streamers()
         self.get_twitch_token()
 
     def get_twitch_token(self):
@@ -54,61 +68,137 @@ class StreamNotifier(discord.Client):
             return data["data"][0]
         return None
 
+    def load_streamers(self):
+        try:
+            if os.path.exists('streamers.json'):
+                with open('streamers.json', 'r') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            logging.error(f"Erro ao carregar streamers: {e}")
+            return {}
+
+    def save_streamers(self, streamers):
+        try:
+            with open('streamers.json', 'w') as f:
+                json.dump(streamers, f, indent=4)
+        except Exception as e:
+            logging.error(f"Erro ao salvar streamers: {e}")
+
     @tasks.loop(minutes=1)
     async def check_streams(self):
-        for username, info in self.streamers.items():
-            is_live, stream_data = self.check_stream_status(username)
-            was_live = self.streamers_status.get(username, False)
-            
-            if is_live and not was_live:
-                channel = self.get_channel(config.NOTIFICATION_CHANNEL_ID)
-                if channel:
-                    user_info = self.get_user_info(username)
+        try:
+            streamers = self.load_streamers()
+            if not streamers:
+                return
+
+            # Obter token de acesso da Twitch
+            token_response = requests.post(
+                'https://id.twitch.tv/oauth2/token',
+                params={
+                    'client_id': config.TWITCH_CLIENT_ID,
+                    'client_secret': config.TWITCH_CLIENT_SECRET,
+                    'grant_type': 'client_credentials'
+                }
+            )
+            token_data = token_response.json()
+            access_token = token_data['access_token']
+
+            # Verificar cada streamer
+            for username in streamers.keys():
+                try:
+                    headers = {
+                        'Client-ID': config.TWITCH_CLIENT_ID,
+                        'Authorization': f'Bearer {access_token}'
+                    }
                     
-                    embed = discord.Embed(
-                        title=f"Twitch Alerts 🔔",
-                        description="Live On",
-                        color=0x6441a5
+                    # Buscar informações do usuário
+                    user_response = requests.get(
+                        f'https://api.twitch.tv/helix/users',
+                        headers=headers,
+                        params={'login': username}
                     )
+                    user_data = user_response.json()
                     
-                    # Adiciona o campo principal com o título da stream
-                    stream_title = f"[LIVE] {username}\n{stream_data['title']}"
-                    if info.get('description'):
-                        stream_title += f"\n{info['description']}"
+                    if not user_data['data']:
+                        logging.warning(f"Usuário {username} não encontrado na Twitch")
+                        continue
+                        
+                    user_id = user_data['data'][0]['id']
                     
-                    embed.add_field(
-                        name="",
-                        value=stream_title,
-                        inline=False
+                    # Buscar informações da stream
+                    stream_response = requests.get(
+                        f'https://api.twitch.tv/helix/streams',
+                        headers=headers,
+                        params={'user_id': user_id}
                     )
+                    stream_data = stream_response.json()
                     
-                    # Adiciona a thumbnail do jogo
-                    if user_info and user_info.get('profile_image_url'):
-                        embed.set_thumbnail(url=user_info['profile_image_url'])
+                    is_live = bool(stream_data['data'])
+                    was_live = self.streamers_status.get(username, False)
                     
-                    # Adiciona os botões
-                    view = discord.ui.View()
-                    view.add_item(discord.ui.Button(
-                        style=discord.ButtonStyle.link,
-                        label=f"Twitch.tv/{username}",
-                        url=f"https://twitch.tv/{username}"
-                    ))
-                    view.add_item(discord.ui.Button(
-                        style=discord.ButtonStyle.link,
-                        label="Watch VOD",
-                        url=f"https://twitch.tv/{username}/videos"
-                    ))
+                    if is_live and not was_live:
+                        try:
+                            channel = self.get_channel(config.NOTIFICATION_CHANNEL_ID)
+                            if not channel:
+                                logging.error(f"Canal {config.NOTIFICATION_CHANNEL_ID} não encontrado")
+                                continue
+                                
+                            stream_info = stream_data['data'][0]
+                            embed = discord.Embed(
+                                title="Twitch Alerts 🔔",
+                                description=f"**{username}** está ao vivo!",
+                                color=discord.Color.purple(),
+                                url=f"https://twitch.tv/{username}"
+                            )
+                            
+                            embed.add_field(
+                                name="Título",
+                                value=stream_info['title'],
+                                inline=False
+                            )
+                            
+                            embed.add_field(
+                                name="Jogando",
+                                value=stream_info['game_name'],
+                                inline=True
+                            )
+                            
+                            embed.add_field(
+                                name="Espectadores",
+                                value=str(stream_info['viewer_count']),
+                                inline=True
+                            )
+                            
+                            embed.set_thumbnail(url=user_data['data'][0]['profile_image_url'])
+                            
+                            view = discord.ui.View()
+                            view.add_item(discord.ui.Button(label="Assistir Live", url=f"https://twitch.tv/{username}", style=discord.ButtonStyle.url))
+                            view.add_item(discord.ui.Button(label="VODs", url=f"https://twitch.tv/{username}/videos", style=discord.ButtonStyle.url))
+                            
+                            await channel.send(embed=embed, view=view)
+                            logging.info(f"Notificação enviada para {username}")
+                        except discord.Forbidden as e:
+                            logging.error(f"Erro de permissão ao enviar mensagem: {e}")
+                        except Exception as e:
+                            logging.error(f"Erro ao enviar notificação: {e}")
                     
-                    await channel.send(embed=embed, view=view)
-            
-            self.streamers_status[username] = is_live
+                    self.streamers_status[username] = is_live
+                    
+                except Exception as e:
+                    logging.error(f"Erro ao verificar streamer {username}: {e}")
+                    continue
+                
+        except Exception as e:
+            logging.error(f"Erro geral no check_streams: {e}")
 
     async def setup_hook(self):
         await self.tree.sync()
         self.check_streams.start()
 
     async def on_ready(self):
-        print(f'Bot está online como {self.user}')
+        logging.info(f'Bot está online como {self.user}')
+        self.check_streams()
 
 client = StreamNotifier()
 
@@ -128,7 +218,7 @@ async def add_streamer(interaction: discord.Interaction, username: str, descript
     
     # Adiciona ou atualiza o streamer
     client.streamers[username] = {"description": description}
-    config.save_streamers(client.streamers)
+    client.save_streamers(client.streamers)
     
     await interaction.response.send_message(
         f"✅ Streamer '{username}' adicionado com sucesso!" +
@@ -142,7 +232,7 @@ async def remove_streamer(interaction: discord.Interaction, username: str):
     username = username.lower()
     if username in client.streamers:
         del client.streamers[username]
-        config.save_streamers(client.streamers)
+        client.save_streamers(client.streamers)
         await interaction.response.send_message(f"✅ Streamer '{username}' removido com sucesso!", ephemeral=True)
     else:
         await interaction.response.send_message(f"❌ Streamer '{username}' não está na lista!", ephemeral=True)
